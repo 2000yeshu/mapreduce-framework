@@ -2,3 +2,7 @@ pkg/
 api.key
 .api.key.trimmed
 *-handin.tar.gz
+
+src/main/mr-wc-all
+src/main/mr-test
+src/main/mr-correct
