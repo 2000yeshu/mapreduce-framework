@@ -11,13 +11,34 @@ import (
 	"strconv"
 )
 
-type RequestTask struct {
-	Type       string
-	TaskNumber int
+type CompleteMapTaskRequest struct {
+	File string
+}
+type CompleteMapTaskResponse struct {
+	Msg string
 }
 
+type CompleteReduceTaskRequest struct {
+	Bucket int
+}
+type CompleteReuduceTaskResponse struct {
+	Msg string
+}
+
+type RequestTask struct{}
+
+type TaskType int
+
+const (
+	MapType TaskType = iota
+	ReduceType
+)
+
 type ResponseTask struct {
-	Task Task
+	TaskType          TaskType
+	InputFileOrPrefix string
+	BucketNumber      int
+	NReduce           int
 }
 
 //

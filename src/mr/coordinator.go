@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -14,240 +15,151 @@ import (
 // TODO: Handout reduce tasks along with map tasks to do the computing early on and
 // give out responsibility to workers as early as possible
 
-type Task struct {
-	Type       string
-	TaskNumber int
-	InputFile  string
-	OutputFile string
+type MapTask struct {
+	TaskID       string
+	BucketNumber int
+	InputFile    string
+}
 
-	// Should be locked
-	Status string
-	// Timer
-
-	WorkerID string
-
-	MapTasks    int
-	ReduceTasks int
+type ReduceTask struct {
+	TaskID          string
+	BucketNumber    int
+	InputFilePrefix string
 }
 
 type Coordinator struct {
 	// Your definitions here.
 	mu sync.Mutex
 
+	nReduce int
+	mMap    int
 	// size: N*M
-	Tasks []*Task
 
-	MapTasks    int
-	ReduceTasks int
+	// to track files that are processes by map function
+	mapTasks map[string]struct{}
 
-	IsMapCompleted bool
+	// to track bucket numbers that are processed by reduce function
+	reduceTasks map[int]struct{}
 
-	isJobCompleted bool
-
-	// isMergeComplete bool
-
-	JobComplete chan int
+	// This timer waits for completion
+	mapTaskCompletionTimer    map[string]chan struct{}
+	reduceTaskCompletionTimer map[int]chan struct{}
 }
 
 // Your code here -- RPC handlers for the worker to call.
-
-// func (c *Coordinator) Merge() {
-// 	// read all files
-// 	// put everything in an arrat of KeyValue
-// 	// sort, external if required
-// 	// write to a file
-// 	<-c.JobComplete
-// 	files, err := ioutil.ReadDir("/temp-mr-out/")
-// 	if err != nil {
-// 		panic(err)
-// 	}
-
-// 	values := []KeyValue{}
-// 	for _, file := range files {
-// 		file, err := os.OpenFile(file.Name(), os.O_RDONLY|os.O_EXCL, 0)
-// 		if err != nil {
-// 			panic(err)
-// 		}
-// 		defer file.Close()
-// 		dec := json.NewDecoder(file)
-// 		for {
-// 			var kv KeyValue
-// 			if err := dec.Decode(&kv); err == io.EOF {
-// 				break
-// 			} else if err != nil {
-// 				panic(err)
-// 			}
-
-// 			values = append(values, kv)
-// 		}
-
-// 	}
-
-// 	sort.Sort(ByKey(values))
-
-// 	prevKey := ""
-// 	currkey := ""
-// 	values := []string{}
-// 	for {
-// 		var kv KeyValue
-
-// 		if err := dec.Decode(&kv); err == io.EOF {
-// 			break
-// 		} else if err != nil {
-// 			panic(err)
-// 		}
-// 		currkey = kv.Key
-// 		if prevKey == "" {
-// 			prevKey = kv.Key
-// 			values = []string{}
-// 			values = append(values, kv.Value)
-// 		}
-// 		if prevKey == currkey {
-// 			values = append(values, kv.Value)
-
-// 		} else {
-
-// 			// write prev key values to file
-// 			if _, err := os.Stat(task.Task.OutputFile); os.IsExist(err) {
-// 				fmt.Println("already exists, skipping", task.Task.OutputFile)
-// 				break
-// 			}
-// 			outfilename := fmt.Sprintf("temp-%s", task.Task.OutputFile)
-// 			outfile, err := os.OpenFile(outfilename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
-// 			if err != nil {
-// 				panic(err)
-// 			}
-
-// 			// meaning prev value is not equal to curr val
-// 			// write the reduce output to corresponding file
-// 			enc := json.NewEncoder(outfile)
-// 			err = enc.Encode(&KeyValue{
-// 				Key:   prevKey,
-// 				Value: reducef(prevKey, values),
-// 			})
-// 			if err != nil {
-// 				panic(err)
-// 			}
-// 			outfile.Close()
-
-// 			prevKey = kv.Key
-// 			values = []string{}
-// 			values = append(values, kv.Value)
-// 		}
-// 	}
-
-// }
-
-func (c *Coordinator) NotResponding(task *Task) {
+func (c *Coordinator) createMapTasks(sourceFiles []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// switch task to init
-	if task.Status == TaskStatuses.InProgress {
-		fmt.Println("10 secs passed since task in progress. switching to init status", task)
-		task.Status = TaskStatuses.Init
+	mapTasks := map[string]struct{}{}
+
+	for _, f := range sourceFiles {
+		mapTasks[f] = struct{}{}
+		c.mapTaskCompletionTimer[f] = make(chan struct{})
 	}
 
+	c.mapTasks = mapTasks
+}
+
+func (c *Coordinator) createReduceTasks(nReduce int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	reduceTasks := map[int]struct{}{}
+
+	for i := 0; i < nReduce; i++ {
+		reduceTasks[i] = struct{}{}
+		c.reduceTaskCompletionTimer[i] = make(chan struct{})
+	}
+
+	c.reduceTasks = reduceTasks
+}
+
+func (c *Coordinator) startMapTaskTimer(mapKey string) {
+	go func() {
+		timer := time.NewTimer(10 * time.Second)
+
+		select {
+		case <-timer.C:
+			// Reinsert task
+			fmt.Println("10 secs elapsed, map task not completed", mapKey)
+			c.mu.Lock()
+			defer c.mu.Unlock()
+
+			c.mapTasks[mapKey] = struct{}{}
+		case <-c.mapTaskCompletionTimer[mapKey]:
+			// Task complete
+		}
+
+		timer.Stop()
+	}()
+}
+
+func (c *Coordinator) startReduceTaskTimer(reduceKey int) {
+	go func() {
+		timer := time.NewTimer(10 * time.Second)
+
+		select {
+		case <-timer.C:
+			// Reinsert task
+			c.mu.Lock()
+			defer c.mu.Unlock()
+
+			c.reduceTasks[reduceKey] = struct{}{}
+		case <-c.reduceTaskCompletionTimer[reduceKey]:
+			// Task complete
+			c.mu.Lock()
+			defer c.mu.Unlock()
+		}
+
+		timer.Stop()
+	}()
 }
 
 func (c *Coordinator) GetTask(args *RequestTask, reply *ResponseTask) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.isJobCompleted {
-		return fmt.Errorf("job completed")
-	}
+	reply.NReduce = c.nReduce
 
-	doesNonCompleteJobExist := false
-
-	for _, task := range c.Tasks {
-		if task.Status != TaskStatuses.Completed {
-			doesNonCompleteJobExist = true
-		}
-		if task.Status == TaskStatuses.Init && task.Status != TaskStatuses.HandedOut {
-			reply.Task = *task
-			task.Status = TaskStatuses.HandedOut
-
-			timer := time.NewTimer(MaxUnavailable)
-			go func(task *Task) {
-				<-timer.C
-				c.NotResponding(task)
-			}(task)
-			return nil
-		}
-	}
-
-	if !doesNonCompleteJobExist {
-		c.isJobCompleted = true
-	}
-
-	// please exit all workers
-	// initiate merge
-
-	return nil
-
-}
-
-func (c *Coordinator) TaskInit(args *RequestTask, reply *ResponseTask) error {
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for _, task := range c.Tasks {
-		if task.Type == args.Type && task.TaskNumber == args.TaskNumber && task.Status != TaskStatuses.Init {
-			task.Status = TaskStatuses.Init
-			reply.Task = *task
-
+	// First handout map task if map is not empty
+	if len(c.mapTasks) != 0 {
+		reply.TaskType = MapType
+		for key := range c.mapTasks {
+			// TODO: pick a random key
+			reply.InputFileOrPrefix = key
 			break
 		}
+
+		delete(c.mapTasks, reply.InputFileOrPrefix)
+		c.startMapTaskTimer(reply.InputFileOrPrefix)
+		return nil
 	}
 
-	return nil
-}
+	if len(c.reduceTasks) != 0 {
+		reply.TaskType = ReduceType
 
-func (c *Coordinator) TaskProgress(args *RequestTask, reply *ResponseTask) error {
+		for bucketNumber := range c.reduceTasks {
+			inputfiles, err := filepath.Glob(fmt.Sprintf("mr-out-*.txt-%d", bucketNumber))
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+			if err != nil {
+				return err
+			}
 
-	for _, task := range c.Tasks {
-		if task.Type == args.Type && task.TaskNumber == args.TaskNumber && task.Status != TaskStatuses.InProgress {
-			task.Status = TaskStatuses.InProgress
-			reply.Task = *task
-			break
+			if len(inputfiles) == c.mMap {
+				reply.BucketNumber = bucketNumber
+				delete(c.reduceTasks, reply.BucketNumber)
+				c.startReduceTaskTimer(reply.BucketNumber)
+
+				return nil
+			}
 		}
+
+		reply.BucketNumber = -1
+		return nil
 	}
 
-	return nil
-}
-
-func (c *Coordinator) TaskCompleted(args *RequestTask, reply *ResponseTask) error {
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	for _, task := range c.Tasks {
-		if task.Type == args.Type && task.TaskNumber == args.TaskNumber && task.Status != TaskStatuses.Completed {
-
-			task.Status = TaskStatuses.Completed
-			reply.Task = *task
-
-			break
-		}
-	}
-
-	return nil
-
-}
-
-func (c *Coordinator) JobCompleted(args *RequestTask, reply *ResponseTask) error {
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.isJobCompleted {
-		return fmt.Errorf("Job completed")
-	}
-	return nil
+	return fmt.Errorf("Job completed")
 }
 
 // an example RPC handler.
@@ -278,58 +190,66 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
-	if c.mu.Lock(); c.isJobCompleted {
-		ret = true
 
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, channel := range c.mapTaskCompletionTimer {
+		select {
+		case <-channel:
+		default:
+			return ret
+		}
 	}
-	c.mu.Unlock()
+
+	for _, channel := range c.reduceTaskCompletionTimer {
+		select {
+		case <-channel:
+		default:
+			return ret
+		}
+	}
+
+	if len(c.mapTasks) == 0 && len(c.reduceTasks) == 0 {
+		ret = true
+	}
 
 	return ret
+}
+
+func (c *Coordinator) CompleteMapTask(args *CompleteMapTaskRequest, reply *CompleteMapTaskResponse) error {
+	close(c.mapTaskCompletionTimer[args.File])
+
+	reply.Msg = "success"
+	return nil
+}
+
+func (c *Coordinator) CompleteReduceTask(args *CompleteReduceTaskRequest, reply *CompleteReuduceTaskResponse) error {
+	close(c.reduceTaskCompletionTimer[args.Bucket])
+
+	reply.Msg = "success"
+	return nil
 }
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-
 	c := Coordinator{}
-	c.IsMapCompleted = false
-	c.isJobCompleted = false
-	c.JobComplete = make(chan int)
-	c.ReduceTasks = nReduce
-	c.MapTasks = len(os.Args[1:])
-	fmt.Println("number of map tasks:", len(os.Args[1:]), "number of reduce tasks:", os.Args[1:])
+
+	// Keeping the nnumber of map workers will be the equal to the number of files
 
 	// Your code here.
 	// Create map tasks with files
-	for mapidx, filename := range os.Args[1:] {
-		temptask := &Task{}
-		temptask.Status = TaskStatuses.Init
+	c.mapTaskCompletionTimer = make(map[string]chan struct{})
+	c.reduceTaskCompletionTimer = make(map[int]chan struct{})
 
-		temptask.Type = TaskTypes.Map
-		temptask.TaskNumber = mapidx + 1
-		temptask.InputFile = filename
-		temptask.OutputFile = ""
-		temptask.ReduceTasks = nReduce
+	c.createMapTasks(os.Args[1:])
+	c.createReduceTasks(nReduce)
 
-		c.Tasks = append(c.Tasks, temptask)
-
-	}
-	for idx := 0; idx < c.ReduceTasks; idx++ {
-		temptask := &Task{}
-		temptask.Status = TaskStatuses.Init
-		temptask.Type = TaskTypes.Reduce
-		temptask.TaskNumber = idx
-		temptask.MapTasks = len(os.Args[1:])
-		//temptask.InputFile = fmt.Sprintf("mr-x-%s", strconv.Itoa(idx))
-		temptask.OutputFile = fmt.Sprintf("mr-out-%d", idx)
-
-		c.Tasks = append(c.Tasks, temptask)
-
-	}
-	// wait for them to complete
+	c.nReduce = nReduce
+	c.mMap = len(os.Args[1:])
 
 	c.server()
-	fmt.Println("server started")
 	return &c
 }

@@ -4,12 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"io/ioutil"
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"sort"
-	"strconv"
 )
 
 // use ihash(key) % NReduce to choose the reduce
@@ -28,136 +27,199 @@ func (a ByKey) Len() int           { return len(a) }
 func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
-func Map(task ResponseTask, mapf func(string, string) []KeyValue) {
-	// TODO: Get number of reduce tasks here
-	noofpart := task.Task.ReduceTasks
-	file, err := os.Open(task.Task.InputFile)
+func Map(task ResponseTask, mapf func(string, string) []KeyValue) error {
+	// this will be a single file
+	// return fmt.Errorf("random error")
+	content, err := os.ReadFile(task.InputFileOrPrefix)
 	if err != nil {
-		panic(err)
+		return err
 	}
-	content, err := ioutil.ReadAll(file)
-	if err != nil {
-		panic(err)
-	}
-	file.Close()
 
-	// gives us intermediate kv
-	kva := mapf(task.Task.InputFile, string(content))
+	kva := mapf(task.InputFileOrPrefix, string(content))
+
+	// Will sort in reduce task
 	sort.Sort(ByKey(kva))
 
 	fileidx := make(map[int]*os.File)
 
-	for i := 0; i < noofpart; i++ {
-		outfile, err := ioutil.TempFile("", fmt.Sprintf("temp-mr-%s-%s-", strconv.Itoa(task.Task.TaskNumber), strconv.Itoa(i)))
+	for i := 0; i < task.NReduce; i++ {
+		filename := fmt.Sprintf("mr-out-%s-%d", filepath.Base(task.InputFileOrPrefix), i)
+
+		outfile, err := os.CreateTemp("/tmp", filename)
+		// outfile, err := os.Create(filename)
 		if err != nil {
-			panic(err)
+			return err
 		}
 
 		fileidx[i] = outfile
-
-		defer func(outfile *os.File, i int, task ResponseTask) {
-			if err := outfile.Close(); err != nil {
-				panic(err)
-			}
-			if err := os.Rename(outfile.Name(), fmt.Sprintf("mr-%s-%s", strconv.Itoa(task.Task.TaskNumber), strconv.Itoa(i))); err != nil {
-				panic(err)
-			}
-		}(outfile, i, task)
-
 	}
 
 	for _, kv := range kva {
-		reducehashkey := ihash(kv.Key)
+		hashkey := ihash(kv.Key)
 
-		outfile := fileidx[reducehashkey%noofpart]
+		outfile := fileidx[hashkey%task.NReduce]
+
 		enc := json.NewEncoder(outfile)
 		if err = enc.Encode(&kv); err != nil {
-			panic(err)
+			return err
 		}
-
 	}
-	TaskComplete(TaskTypes.Map, task.Task.TaskNumber)
-	// for i := 0; i < noofpart; i++ {
-	// 	err := os.Rename(fmt.Sprintf("mr-intm-val/temp-mr-%s-%s", strconv.Itoa(task.Task.TaskNumber), strconv.Itoa(i)), fmt.Sprintf("mr-intm-val/mr-%s-%s", strconv.Itoa(task.Task.TaskNumber), strconv.Itoa(i)))
-	// 	if err != nil {
-	// 		panic(err)
-	// 	}
-	// }
 
+	// Rename all files
+	for i, file := range fileidx {
+		file.Close()
+
+		if err := os.Rename(file.Name(), fmt.Sprintf("mr-out-%s-%d", filepath.Base(task.InputFileOrPrefix), i)); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func Reduce(task ResponseTask, reducef func(string, []string) string) {
+func Reduce(task ResponseTask, reducef func(string, []string) string) error {
+	outfilename := fmt.Sprintf("mr-out-%d", task.BucketNumber)
 
 	// read all files
 	// store their data in a []KeyValue arr
 	// sort the arr
 	// run reduce function on key and arr of values
+	inputfiles, err := filepath.Glob(fmt.Sprintf("mr-out-*.txt-%d", task.BucketNumber))
 
-	if _, err := os.Stat(task.Task.OutputFile); os.IsExist(err) {
-		return
-	}
-	outfilename := task.Task.OutputFile
-	outfile, err := os.OpenFile(outfilename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
 	if err != nil {
-		panic(err)
+		return err
 	}
-	defer outfile.Close()
+
+	if f, err := os.Stat(outfilename); f != nil && err == nil {
+		return err
+	}
+
+	outfile, err := os.CreateTemp("/tmp", outfilename)
+	// outfile, err := os.OpenFile(outfilename, os.O_CREATE|os.O_APPEND|os.O_RDWR, 0644)
+
+	if err != nil {
+		return err
+	}
+
+	// defer outfile.Close()
 
 	content := []KeyValue{}
 
-	for i := 1; i <= task.Task.MapTasks; i++ {
-		immFileName := fmt.Sprintf("mr-%d-%d", i, task.Task.TaskNumber)
-		file, err := os.OpenFile(immFileName, os.O_RDONLY|os.O_EXCL, 0)
+	// Read from M files
+
+	// if err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
+	// 	if d.IsDir() {
+	// 		return nil
+	// 	}
+
+	// 	if strings.HasPrefix(path, "mr-out-") && strings.HasSuffix(path, fmt.Sprintf(".txt-%d", task.BucketNumber)) {
+	// 		file, err := os.OpenFile(path, os.O_RDONLY|os.O_EXCL, 0)
+
+	// 		if err != nil {
+	// 			return err
+	// 		}
+
+	// 		defer os.Remove(path)
+	// 		// defer file.Close()
+
+	// 		dec := json.NewDecoder(file)
+
+	// 		for dec.More() {
+	// 			var kv KeyValue
+
+	// 			if err := dec.Decode(&kv); err != nil {
+	// 				return err
+	// 			}
+
+	// 			// err != nil && err.Error() != "EOF" {
+	// 			// 	return err
+	// 			// } else if err != nil && err.Error() == "EOF" {
+	// 			// 	break
+	// 			// }
+
+	// 			content = append(content, kv)
+	// 		}
+	// 	}
+	// 	return nil
+	// }); err != nil {
+	// 	return err
+	// }
+
+	for _, intFile := range inputfiles {
+		file, err := os.OpenFile(intFile, os.O_RDONLY|os.O_EXCL, 0)
+
 		if err != nil {
-			panic(err)
+			return err
 		}
+
+		defer os.Remove(intFile)
+		// defer file.Close()
 
 		dec := json.NewDecoder(file)
 
-		for {
+		for dec.More() {
 			var kv KeyValue
 
 			if err := dec.Decode(&kv); err != nil {
-				break
+				return err
 			}
 
-			content = append(content, kv)
+			// err != nil && err.Error() != "EOF" {
+			// 	return err
+			// } else if err != nil && err.Error() == "EOF" {
+			// 	break
+			// }
 
+			content = append(content, kv)
 		}
-		file.Close()
 	}
 
 	sort.Sort(ByKey(content))
 
-	prevKey := ""
-	currkey := ""
-	values := []string{}
-	for _, kv := range content {
-		currkey = kv.Key
-		if prevKey == "" {
-			prevKey = kv.Key
-			values = []string{}
-			values = append(values, kv.Value)
-			continue
+	// var i, j int
+
+	// values := make([]string, 0)
+
+	// for {
+	// 	if j == len(content) {
+
+	// 		fmt.Fprintf(outfile, "%v %v\n", content[i].Key, reducef(content[i].Key, values))
+	// 		break
+	// 	}
+	// 	if content[i].Key == content[j].Key {
+	// 		values = append(values, content[j].Value)
+	// 		j++
+	// 	} else {
+	// 		fmt.Fprintf(outfile, "%v %v\n", content[i].Key, reducef(content[i].Key, values))
+	// 		values = []string{}
+	// 		i = j
+	// 	}
+	// }
+	i := 0
+	for i < len(content) {
+		j := i + 1
+		for j < len(content) && content[j].Key == content[i].Key {
+			j++
 		}
-		if prevKey == currkey {
-			values = append(values, kv.Value)
-
-		} else {
-
-			// write prev key values to file
-
-			fmt.Fprintf(outfile, "%v %v\n", prevKey, reducef(prevKey, values))
-
-			prevKey = kv.Key
-			values = []string{}
-			values = append(values, kv.Value)
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, content[k].Value)
 		}
+		output := reducef(content[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(outfile, "%v %v\n", content[i].Key, output)
+
+		i = j
 	}
-	// for writing the last value
-	fmt.Fprintf(outfile, "%v %v\n", currkey, reducef(currkey, values))
-	TaskComplete(TaskTypes.Reduce, task.Task.TaskNumber)
 
+	outfile.Close()
+
+	if err := os.Rename(outfile.Name(), outfilename); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // main/mrworker.go calls this function.
@@ -165,103 +227,75 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 
 	// Your worker implementation here.
 	//
-	// fetch responsetask and execute it
-	// again fetch and execute
 	for {
-		ok := JobCompleted()
-		if !ok {
-			return
-		}
 		task, err := AskForTask()
 		if err != nil {
+			panic(err)
+		}
+
+		if task.BucketNumber == -1 {
 			continue
 		}
 
-		if task.Task.Type == TaskTypes.Map {
-			TaskProgress(task.Task.Type, task.Task.TaskNumber)
-			Map(task, mapf)
-		} else if task.Task.Type == TaskTypes.Reduce {
-			// check if all the files exist
-			foundAllFiles := true
-			// first check all files exist need for reduce task
-			for i := 1; i <= task.Task.MapTasks; i++ {
-				immFileName := fmt.Sprintf("mr-%d-%d", i, task.Task.TaskNumber)
-
-				if _, err := os.Stat(immFileName); os.IsNotExist(err) {
-					foundAllFiles = false
-				}
+		switch task.TaskType {
+		case MapType:
+			err := Map(task, mapf)
+			if err == nil {
+				DoneMapTask(task.InputFileOrPrefix)
+			} else {
+				panic(err)
 			}
-			if !foundAllFiles {
-				TaskInit(task.Task.Type, task.Task.TaskNumber)
-				continue
+		case ReduceType:
+			err := Reduce(task, reducef)
+			if err == nil {
+				DoneReduceTask(task.BucketNumber)
+			} else {
+				panic(err)
 			}
-			TaskProgress(task.Task.Type, task.Task.TaskNumber)
-			Reduce(task, reducef)
 		}
-		//time.Sleep(2 * time.Second)
-
-	}
-
-}
-
-func TaskComplete(taskType string, taskNumber int) {
-	args := RequestTask{}
-	args.Type = taskType
-	args.TaskNumber = taskNumber
-
-	reply := ResponseTask{}
-	ok := call("Coordinator.TaskCompleted", &args, &reply)
-	if !ok {
-		os.Exit(0)
 	}
 }
 
-func JobCompleted() bool {
-	args := RequestTask{}
-	reply := ResponseTask{}
-	ok := call("Coordinator.JobCompleted", &args, &reply)
-	return ok
+func DoneMapTask(file string) error {
+	arg := CompleteMapTaskRequest{
+		File: file,
+	}
 
-}
-
-func TaskProgress(taskType string, taskNumber int) {
-	args := RequestTask{}
-	args.Type = taskType
-	args.TaskNumber = taskNumber
-
-	reply := ResponseTask{}
-	ok := call("Coordinator.TaskProgress", &args, &reply)
-	if !ok {
+	reply := CompleteMapTaskResponse{}
+	ok := call("Coordinator.CompleteMapTask", &arg, &reply)
+	if ok {
+		return nil
+	} else {
 		os.Exit(0)
+		return fmt.Errorf("failed to get reply")
 	}
 }
 
-func TaskInit(taskType string, taskNumber int) {
-	args := RequestTask{}
-	args.Type = taskType
-	args.TaskNumber = taskNumber
+func DoneReduceTask(bucket int) error {
+	arg := CompleteReduceTaskRequest{
+		Bucket: bucket,
+	}
 
-	reply := ResponseTask{}
-	ok := call("Coordinator.TaskInit", &args, &reply)
-	if !ok {
+	reply := CompleteMapTaskResponse{}
+	ok := call("Coordinator.CompleteReduceTask", &arg, &reply)
+	if ok {
+		return nil
+	} else {
 		os.Exit(0)
+		return fmt.Errorf("failed to get reply")
 	}
 }
 
 func AskForTask() (ResponseTask, error) {
-	args := RequestTask{}
-	args.Type = "Task"
-
+	arg := RequestTask{}
 	reply := ResponseTask{}
-
-	ok := call("Coordinator.GetTask", &args, &reply)
+	ok := call("Coordinator.GetTask", &arg, &reply)
 	if ok {
 		return reply, nil
 	} else {
 		os.Exit(0)
 		return reply, fmt.Errorf("failed to get reply")
 	}
-
 }
 
 // example function to show how to make an RPC call to the coordinator.
@@ -305,6 +339,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	defer c.Close()
 
 	err = c.Call(rpcname, args, reply)
+
 	return err == nil
 
 }
